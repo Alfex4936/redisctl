@@ -10,6 +10,7 @@ import (
 	"redisctl/internal/redis"
 	"redisctl/internal/styles"
 
+	redisClient "github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
 )
 
@@ -173,58 +174,24 @@ func runAddNode(newNode, existingNode, masterID string) error {
 	if masterID != "" {
 		fmt.Println(styles.InfoStyle.Render("5단계: 복제본 설정 중..."))
 
-		// 잠깐 기다려야지... 클러스터 상태 안정화 (동적 대기로 개선)
-		fmt.Print("  클러스터 상태 안정화 대기 중...")
-		err := waitForClusterStable(cm, existingNode, 10*time.Second)
+		// Redis-native approach: 새 노드가 마스터를 인식할 때까지 대기
+		fmt.Print("  마스터 노드 인식 대기 중...")
+		err := waitUntilNodeKnowsMaster(newClient, masterID, 15*time.Second)
 		if err != nil {
-			fmt.Printf(" %s\n", styles.RenderWarning("타임아웃 - 하드코딩 대기로 fallback"))
-			time.Sleep(3 * time.Second)
-		} else {
-			fmt.Printf(" %s\n", styles.RenderSuccess("완료"))
+			fmt.Printf(" %s\n", styles.RenderError("실패"))
+			rollbackAddNode(cm, newNode, existingNode)
+			return fmt.Errorf("마스터 노드 인식 대기 실패: %w", err)
 		}
+		fmt.Printf(" %s\n", styles.RenderSuccess("완료"))
 
 		fmt.Printf("  %s를 %s의 복제본으로 설정 중...", newNode, masterID)
 
-		// 복제본 설정 재시도 로직 (마스터 노드 정보 동기화 대기)
-		maxRetries := 5
-		var replicateErr error
-
-		for retry := 0; retry < maxRetries; retry++ {
-			if retry > 0 {
-				// 재시도 전 추가 대기 (클러스터 동기화를 위해)
-				time.Sleep(time.Second * 3)
-				fmt.Printf("\n    재시도 %d/%d...", retry+1, maxRetries)
-			}
-
-			replicateErr = newClient.ClusterReplicate(ctx, masterID).Err()
-			if replicateErr == nil {
-				break // 성공
-			}
-
-			// "Unknown node" 오류인 경우 추가 대기 후 재시도
-			if strings.Contains(replicateErr.Error(), "Unknown node") && retry < maxRetries-1 {
-				fmt.Printf(" (마스터 노드 동기화 대기 중)")
-				continue
-			}
-		}
-
-		if replicateErr != nil {
+		// 이제 안전하게 복제본 설정 (전제조건이 충족됨)
+		err = newClient.ClusterReplicate(ctx, masterID).Err()
+		if err != nil {
 			fmt.Printf(" %s\n", styles.RenderError("복제 설정 실패"))
-
-			// 디버그 정보 제공
-			fmt.Printf("\n디버그 정보:\n")
-			fmt.Printf("  마스터 ID: %s\n", masterID)
-			fmt.Printf("  오류: %v\n", replicateErr)
-
-			// 새 노드에서 클러스터 노드 목록 확인 시도
-			if clusterNodes, err := newClient.ClusterNodes(ctx).Result(); err == nil {
-				nodeCount := len(strings.Split(clusterNodes, "\n")) - 1 // 빈 줄 제외
-				fmt.Printf("  새 노드가 인식한 클러스터 노드 수: %d\n", nodeCount)
-			}
-
-			// 복제 설정 실패 시 롤백
 			rollbackAddNode(cm, newNode, existingNode)
-			return fmt.Errorf("CLUSTER REPLICATE 명령 실패: %w", replicateErr)
+			return fmt.Errorf("CLUSTER REPLICATE 명령 실패: %w", err)
 		}
 
 		fmt.Printf(" %s\n", styles.RenderSuccess("복제본 설정 완료"))
@@ -446,4 +413,38 @@ func rollbackAddNode(cm *redis.ClusterManager, newNode, existingNode string) {
 			}
 		}
 	}
+}
+
+// Redis-native approach: 새 노드가 특정 마스터를 인식할 때까지 대기
+func waitUntilNodeKnowsMaster(newClient *redisClient.Client, masterID string, timeout time.Duration) error {
+	ctx := context.Background()
+	deadline := time.Now().Add(timeout)
+
+	for time.Now().Before(deadline) {
+		nodes, err := newClient.ClusterNodes(ctx).Result()
+		if err != nil {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+
+		// Parse cluster nodes and check if master is visible
+		if isNodeVisibleInCluster(nodes, masterID) {
+			return nil
+		}
+
+		time.Sleep(200 * time.Millisecond) // Short polling interval
+	}
+
+	return fmt.Errorf("timeout: 새 노드가 마스터 %s를 인식하지 못했습니다", masterID)
+}
+
+// Check if a node ID is visible in CLUSTER NODES output
+func isNodeVisibleInCluster(clusterNodes string, nodeID string) bool {
+	lines := strings.Split(clusterNodes, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), nodeID) {
+			return true
+		}
+	}
+	return false
 }
